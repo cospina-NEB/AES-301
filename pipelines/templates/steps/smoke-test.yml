@@ -1,0 +1,34 @@
+# Polls a health endpoint until it returns HTTP 200, failing the job after the last attempt.
+
+parameters:
+  - name: url
+    type: string
+  - name: displayName
+    type: string
+    default: Smoke test
+  - name: attempts
+    type: number
+    default: 10
+  - name: delaySeconds
+    type: number
+    default: 15
+
+steps:
+  - pwsh: |
+      $url = '${{ parameters.url }}'
+      for ($i = 1; $i -le ${{ parameters.attempts }}; $i++) {
+        try {
+          $response = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 30
+          if ($response.StatusCode -eq 200) {
+            Write-Host "Healthy: $url"
+            exit 0
+          }
+          Write-Host "Attempt ${i}: HTTP $($response.StatusCode)"
+        } catch {
+          Write-Host "Attempt ${i}: $($_.Exception.Message)"
+        }
+        Start-Sleep -Seconds ${{ parameters.delaySeconds }}
+      }
+      Write-Host "##vso[task.logissue type=error]Health check failed after ${{ parameters.attempts }} attempts: $url"
+      exit 1
+    displayName: ${{ parameters.displayName }}

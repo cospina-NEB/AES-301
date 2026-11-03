@@ -1,0 +1,126 @@
+# CI job for the .NET app: restore → build → lint → dependency scan → SAST → unit tests + coverage gate → package.
+# Publishes the "app" pipeline artifact (zip for App Service) consumed by the deploy stages.
+
+jobs:
+  - job: Build
+    displayName: Build, analyze, test, package
+    steps:
+      - checkout: self
+
+      - task: UseDotNet@2
+        displayName: Install .NET SDK $(dotnetVersion)
+        inputs:
+          packageType: sdk
+          version: $(dotnetVersion)
+
+      # 1. Restore / build
+      - script: dotnet restore "$(solution)"
+        displayName: Restore
+
+      - script: dotnet build "$(solution)" --configuration $(buildConfiguration) --no-restore
+        displayName: Build
+
+      # 2. Static analysis
+      - script: dotnet format "$(solution)" --verify-no-changes --no-restore
+        displayName: Lint (dotnet format)
+
+      - bash: |
+          set -euo pipefail
+          dotnet list "$(solution)" package --vulnerable --include-transitive | tee vulnerable.txt
+          if grep -q "has the following vulnerable packages" vulnerable.txt; then
+            echo "##vso[task.logissue type=error]Vulnerable NuGet packages found (see log above)."
+            exit 1
+          fi
+        displayName: Dependency scan (vulnerable NuGet packages)
+
+      - bash: |
+          set -euo pipefail
+          python3 -m pip install --quiet --user semgrep
+          export PATH="$HOME/.local/bin:$PATH"
+          semgrep scan --config p/csharp --config p/secrets --error --metrics off
+        displayName: SAST (Semgrep)
+
+      # 3. Unit tests with coverage gate
+      - script: >-
+          dotnet test "$(solution)"
+          --configuration $(buildConfiguration)
+          --no-build
+          --logger trx
+          --collect "XPlat Code Coverage"
+          --results-directory "$(Agent.TempDirectory)/TestResults"
+        displayName: Unit tests
+
+      - task: PublishTestResults@2
+        displayName: Publish test results
+        condition: succeededOrFailed()
+        inputs:
+          testResultsFormat: VSTest
+          testResultsFiles: $(Agent.TempDirectory)/TestResults/**/*.trx
+          failTaskOnMissingResultsFile: false
+
+      - task: PublishCodeCoverageResults@2
+        displayName: Publish coverage
+        condition: succeededOrFailed()
+        inputs:
+          summaryFileLocation: $(Agent.TempDirectory)/TestResults/**/coverage.cobertura.xml
+
+      - pwsh: |
+          $files = Get-ChildItem -Path "$(Agent.TempDirectory)/TestResults" -Recurse -Filter coverage.cobertura.xml
+          if (-not $files) {
+            Write-Host "##vso[task.logissue type=error]No coverage reports found."
+            exit 1
+          }
+          # Sums lines across test projects. If several test projects cover the same assembly,
+          # merge reports first (e.g. ReportGenerator) for an exact figure.
+          $covered = 0; $valid = 0
+          foreach ($f in $files) {
+            [xml]$report = Get-Content $f.FullName
+            $covered += [int]$report.coverage.'lines-covered'
+            $valid   += [int]$report.coverage.'lines-valid'
+          }
+          $pct = if ($valid -eq 0) { 0 } else { [math]::Round(100 * $covered / $valid, 2) }
+          $threshold = [double]'$(coverageThreshold)'
+          Write-Host "Line coverage: $pct% (threshold $threshold%)"
+          if ($pct -lt $threshold) {
+            Write-Host "##vso[task.logissue type=error]Line coverage $pct% is below the $threshold% gate."
+            exit 1
+          }
+        displayName: Coverage gate
+
+      # 4. Package
+      - script: >-
+          dotnet publish "$(webProject)"
+          --configuration $(buildConfiguration)
+          --no-build
+          --output "$(Build.ArtifactStagingDirectory)/publish"
+        displayName: Publish web project
+
+      - task: ArchiveFiles@2
+        displayName: Zip package
+        inputs:
+          rootFolderOrFile: $(Build.ArtifactStagingDirectory)/publish
+          includeRootFolder: false
+          archiveType: zip
+          archiveFile: $(Build.ArtifactStagingDirectory)/app/$(appName)-$(Build.BuildNumber).zip
+
+      - publish: $(Build.ArtifactStagingDirectory)/app
+        artifact: app
+        displayName: Publish pipeline artifact (app)
+
+      - task: UniversalPackages@0
+        displayName: Push package to Azure Artifacts
+        condition: >-
+          and(succeeded(),
+              ne(variables['artifactFeed'], ''),
+              ne(variables['Build.Reason'], 'PullRequest'),
+              or(eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+                 startsWith(variables['Build.SourceBranch'], 'refs/tags/v')))
+        inputs:
+          command: publish
+          publishDirectory: $(Build.ArtifactStagingDirectory)/app
+          feedsToUsePublish: internal
+          vstsFeedPublish: $(artifactFeed)
+          vstsFeedPackagePublish: $(appName)-app
+          versionOption: custom
+          versionPublish: $(packageVersion)
+          packagePublishDescription: $(appName) build $(Build.BuildNumber) ($(Build.SourceVersion))

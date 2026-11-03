@@ -9,7 +9,7 @@ The full design is in [azure-devops-ecosystem-plan.md](azure-devops-ecosystem-pl
 | Step | | Status |
 | --- | --- | --- |
 | 1 | Scaffold repo layout with Bicep modules per environment | Done |
-| 2 | Multi-stage `azure-pipelines.yml` | Not started |
+| 2 | Multi-stage `azure-pipelines.yml` ([AES-304](https://nebulas.atlassian.net/browse/AES-304)) | Written, not yet run |
 | 3 | Claude API PR-bot script wired into CI | Not started |
 | 4 | Azure DevOps Environments with approval gates | Not started |
 | 5 | Key Vault + variable groups per environment | Not started |
@@ -29,10 +29,36 @@ infra/
     qa.bicepparam
     staging.bicepparam
     prod.bicepparam
+azure-pipelines.yml       # pipeline entry point: stage order and triggers
+pipelines/
+  variables/common.yml    # app name, .NET version, solution path, coverage gate, feed
+  templates/
+    jobs/                 # CI: build-dotnet, validate-infra
+    stages/               # deploy-env (one per environment), swap-slot (Prod)
+    steps/                # deploy-infra, smoke-test, swap-and-verify
 bicepconfig.json          # Bicep linter rules
 .azuredevops/
   pull_request_template.md
 ```
+
+## Pipeline
+
+| Trigger | What runs |
+| --- | --- |
+| PR to `main` | CI: restore, build, `dotnet format`, vulnerable-package scan, Semgrep, unit tests with a 75% line-coverage gate, package. Also Bicep lint, plus what-if for every environment if the PR touches `/infra` |
+| Merge to `main` | CI → Dev → QA |
+| Tag `v*`, or a manual run with **Promote to Staging** | CI → Dev → QA → Staging → Prod (slot) → Prod (swap) |
+
+Prod has two approval gates. **Prod (slot)** deploys infra and the app to the staging slot, then runs smoke tests. **Prod (swap)** swaps the slot into production, runs a health check, and swaps back automatically if the check fails.
+
+### One-time setup before the first run
+
+1. **Application:** add the .NET 8 solution at `Aes301.sln`, with the web project at `src/Aes301.Web/Aes301.Web.csproj` and at least one test project. The app must serve `GET /health` with HTTP 200. To use different paths, change `pipelines/variables/common.yml`.
+2. **Resource groups:** create `rg-app-dev`, `rg-app-qa`, `rg-app-staging` and `rg-app-prod`.
+3. **Service connections:** create `sc-aes301-dev`, `sc-aes301-qa`, `sc-aes301-staging` and `sc-aes301-prod`. Each one is an Azure Resource Manager connection scoped to its own resource group. The infra deploy creates Key Vault role assignments, so each connection's identity needs **Contributor** plus **Role Based Access Control Administrator** on its resource group.
+4. **Environments:** create `aes301-dev`, `aes301-qa`, `aes301-staging`, `aes301-prod` and `aes301-prod-swap` in Azure DevOps. Add approvals according to the [Environments](#environments) table. Put the 2+ approvers on `aes301-prod`, and an approval on `aes301-prod-swap` (plan step 4).
+5. **Pipeline:** create a pipeline from `azure-pipelines.yml` using the GitHub connection. In GitHub branch protection for `main`, make this pipeline's check required.
+6. **Optional:** to also push the app zip to Azure Artifacts, set `artifactFeed` in `pipelines/variables/common.yml`.
 
 ## Environments
 

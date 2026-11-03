@@ -1,0 +1,32 @@
+# Deploys infra/main.bicep with the environment's param file, then exposes the outputs as job variables:
+#   webAppName, webAppHostName, slotHostName
+
+parameters:
+  - name: environmentName
+    type: string
+
+steps:
+  - task: AzureCLI@2
+    displayName: Deploy infrastructure (${{ parameters.environmentName }})
+    inputs:
+      azureSubscription: sc-aes301-${{ parameters.environmentName }}
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        set -euo pipefail
+        outputs=$(az deployment group create \
+          --name "$(appName)-$(Build.BuildId)" \
+          --resource-group rg-app-${{ parameters.environmentName }} \
+          --template-file "$(Pipeline.Workspace)/infra/main.bicep" \
+          --parameters "$(Pipeline.Workspace)/infra/params/${{ parameters.environmentName }}.bicepparam" \
+          --query properties.outputs \
+          --output json)
+
+        webAppName=$(echo "$outputs" | jq -r '.webAppName.value')
+        webAppHostName=$(echo "$outputs" | jq -r '.webAppHostName.value')
+        slotHostName=$(echo "$outputs" | jq -r '.stagingSlotHostName.value')
+
+        echo "Web app: $webAppName ($webAppHostName)"
+        echo "##vso[task.setvariable variable=webAppName]$webAppName"
+        echo "##vso[task.setvariable variable=webAppHostName]$webAppHostName"
+        echo "##vso[task.setvariable variable=slotHostName]$slotHostName"

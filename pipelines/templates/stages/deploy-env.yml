@@ -1,0 +1,90 @@
+# Deploy stage for one environment, run as a deployment job against the ADO Environment so approvals,
+# checks and deployment history apply.
+#
+#   useSlot: false → infra → deploy straight to production → smoke test             (Dev)
+#   useSlot: true  → infra → deploy to "staging" slot → smoke test slot → [slotTestSteps]
+#                    → swap → post-swap health check → swap back on failure        (QA, Staging)
+#   useSlot: true, swapInStage: false → stop after the slot tests; a later swap-slot.yml stage
+#                    swaps behind its own approval                                  (Prod)
+
+parameters:
+  - name: environmentName
+    type: string
+    values: [dev, qa, staging, prod]
+  - name: displayName
+    type: string
+  - name: dependsOn
+    type: object
+  - name: condition
+    type: string
+    default: succeeded()
+  - name: useSlot
+    type: boolean
+  - name: swapInStage
+    type: boolean
+    default: true
+  - name: adoEnvironment
+    type: string
+    default: ''
+  - name: slotTestSteps
+    type: stepList
+    default: []
+
+stages:
+  - stage: Deploy_${{ parameters.environmentName }}
+    displayName: ${{ parameters.displayName }}
+    dependsOn: ${{ parameters.dependsOn }}
+    condition: ${{ parameters.condition }}
+    jobs:
+      - deployment: Deploy
+        displayName: Deploy to ${{ parameters.displayName }}
+        ${{ if eq(parameters.adoEnvironment, '') }}:
+          environment: aes301-${{ parameters.environmentName }}
+        ${{ else }}:
+          environment: ${{ parameters.adoEnvironment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: infra
+                - download: current
+                  artifact: app
+
+                - template: ../steps/deploy-infra.yml
+                  parameters:
+                    environmentName: ${{ parameters.environmentName }}
+
+                - task: AzureWebApp@1
+                  ${{ if parameters.useSlot }}:
+                    displayName: Deploy app to staging slot
+                  ${{ else }}:
+                    displayName: Deploy app
+                  inputs:
+                    azureSubscription: sc-aes301-${{ parameters.environmentName }}
+                    appType: webAppLinux
+                    appName: $(webAppName)
+                    resourceGroupName: rg-app-${{ parameters.environmentName }}
+                    ${{ if parameters.useSlot }}:
+                      deployToSlotOrASE: true
+                      slotName: staging
+                    package: $(Pipeline.Workspace)/app/*.zip
+
+                - ${{ if parameters.useSlot }}:
+                    - template: ../steps/smoke-test.yml
+                      parameters:
+                        displayName: Smoke test (staging slot)
+                        url: https://$(slotHostName)$(healthCheckPath)
+
+                    - ${{ parameters.slotTestSteps }}
+
+                    - ${{ if parameters.swapInStage }}:
+                        - template: ../steps/swap-and-verify.yml
+                          parameters:
+                            environmentName: ${{ parameters.environmentName }}
+
+                - ${{ else }}:
+                    - template: ../steps/smoke-test.yml
+                      parameters:
+                        displayName: Smoke test
+                        url: https://$(webAppHostName)$(healthCheckPath)

@@ -1,0 +1,56 @@
+# Standalone swap stage, used for Prod so the swap sits behind its own ADO Environment approval
+# after the slot has been deployed and smoke tested by deploy-env.yml (swapInStage: false).
+
+parameters:
+  - name: environmentName
+    type: string
+    values: [dev, qa, staging, prod]
+  - name: displayName
+    type: string
+  - name: dependsOn
+    type: object
+  - name: adoEnvironment
+    type: string
+  - name: condition
+    type: string
+    default: succeeded()
+
+stages:
+  - stage: Swap_${{ parameters.environmentName }}
+    displayName: ${{ parameters.displayName }}
+    dependsOn: ${{ parameters.dependsOn }}
+    condition: ${{ parameters.condition }}
+    jobs:
+      - deployment: Swap
+        displayName: Swap ${{ parameters.environmentName }} slot into production
+        environment: ${{ parameters.adoEnvironment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: none
+
+                - task: AzureCLI@2
+                  displayName: Find web app
+                  inputs:
+                    azureSubscription: sc-aes301-${{ parameters.environmentName }}
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      rg=rg-app-${{ parameters.environmentName }}
+                      name=$(az webapp list --resource-group "$rg" \
+                        --query "[?tags.workload=='$(appName)'] | [0].name" --output tsv)
+                      if [ -z "$name" ]; then
+                        echo "##vso[task.logissue type=error]No web app tagged workload=$(appName) in $rg."
+                        exit 1
+                      fi
+                      host=$(az webapp show --resource-group "$rg" --name "$name" \
+                        --query defaultHostName --output tsv)
+                      echo "Web app: $name ($host)"
+                      echo "##vso[task.setvariable variable=webAppName]$name"
+                      echo "##vso[task.setvariable variable=webAppHostName]$host"
+
+                - template: ../steps/swap-and-verify.yml
+                  parameters:
+                    environmentName: ${{ parameters.environmentName }}

@@ -1,0 +1,21 @@
+variables:
+  # Must match appName in infra/params/*.bicepparam (used to find the web app by its "workload" tag).
+  appName: aes301
+
+  # .NET build. The solution and web project don't exist yet; create them at these paths
+  # (or update these values) when the app is added.
+  dotnetVersion: 8.x
+  buildConfiguration: Release
+  solution: Aes301.sln
+  webProject: src/Aes301.Web/Aes301.Web.csproj
+
+  # Unit-test line coverage gate, in percent.
+  coverageThreshold: 75
+
+  # Must match healthCheckPath in infra/main.bicep. The app must serve it with HTTP 200.
+  healthCheckPath: /health
+
+  # Azure Artifacts feed for the app zip (Universal Package). Leave empty to skip the push.
+  # Format: <feed> for an org-scoped feed or <project>/<feed> for a project-scoped one.
+  artifactFeed: ''
+  packageVersion: 0.1.$(Build.BuildId)

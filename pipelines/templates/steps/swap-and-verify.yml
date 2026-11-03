@@ -1,0 +1,37 @@
+# Swaps the "staging" slot into production, health-checks production, and swaps back if anything after
+# the swap fails. Expects job variables webAppName and webAppHostName.
+
+parameters:
+  - name: environmentName
+    type: string
+
+steps:
+  - task: AzureAppServiceManage@0
+    displayName: Swap staging slot into production
+    inputs:
+      azureSubscription: sc-aes301-${{ parameters.environmentName }}
+      Action: Swap Slots
+      WebAppName: $(webAppName)
+      ResourceGroupName: rg-app-${{ parameters.environmentName }}
+      SourceSlot: staging
+      SwapWithProduction: true
+
+  - bash: echo "##vso[task.setvariable variable=slotSwapped]true"
+    displayName: Record swap
+
+  - template: smoke-test.yml
+    parameters:
+      displayName: Post-swap health check (production)
+      url: https://$(webAppHostName)$(healthCheckPath)
+
+  # Swapping again restores the previous production build, which is now sitting in the staging slot.
+  - task: AzureAppServiceManage@0
+    displayName: Roll back (swap back)
+    condition: and(failed(), eq(variables['slotSwapped'], 'true'))
+    inputs:
+      azureSubscription: sc-aes301-${{ parameters.environmentName }}
+      Action: Swap Slots
+      WebAppName: $(webAppName)
+      ResourceGroupName: rg-app-${{ parameters.environmentName }}
+      SourceSlot: staging
+      SwapWithProduction: true

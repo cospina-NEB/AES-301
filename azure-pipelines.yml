@@ -1,0 +1,101 @@
+# AES-301 multi-stage pipeline: CI → Dev → QA → Staging → Prod (slot) → Prod (swap)
+#
+# Conventions the templates rely on (one per environment: dev, qa, staging, prod):
+#   Service connection      sc-aes301-<env>      scoped to rg-app-<env> only
+#   Resource group          rg-app-<env>         must exist before the first deploy
+#   ADO Environment         aes301-<env>         approvals/checks are configured on these
+#   Extra Prod gate         aes301-prod-swap     approval between Prod smoke tests and the swap
+#
+# Trigger rules:
+#   PR to main      → CI only (build, analysis, tests, package, Bicep lint + what-if if /infra changed)
+#   Merge to main   → CI → Dev → QA
+#   Tag v*          → CI → Dev → QA → Staging → Prod (approval gated)
+#   Manual run with "Promote to Staging" on main → same as a tag
+
+name: $(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include:
+      - main
+  tags:
+    include:
+      - v*
+
+pr:
+  branches:
+    include:
+      - main
+
+parameters:
+  - name: promoteToStaging
+    displayName: Promote this run to Staging (and on to the Prod approval)
+    type: boolean
+    default: false
+
+variables:
+  - template: pipelines/variables/common.yml
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  - stage: CI
+    displayName: Build and validate
+    jobs:
+      - template: pipelines/templates/jobs/build-dotnet.yml
+      - template: pipelines/templates/jobs/validate-infra.yml
+        parameters:
+          environments: [dev, qa, staging, prod]
+
+  - template: pipelines/templates/stages/deploy-env.yml
+    parameters:
+      environmentName: dev
+      displayName: Dev
+      dependsOn: CI
+      condition: >-
+        and(succeeded(),
+            ne(variables['Build.Reason'], 'PullRequest'),
+            or(eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+               startsWith(variables['Build.SourceBranch'], 'refs/tags/v')))
+      useSlot: false
+
+  - template: pipelines/templates/stages/deploy-env.yml
+    parameters:
+      environmentName: qa
+      displayName: QA
+      dependsOn: Deploy_dev
+      useSlot: true
+
+  - template: pipelines/templates/stages/deploy-env.yml
+    parameters:
+      environmentName: staging
+      displayName: Staging
+      dependsOn: Deploy_qa
+      condition: >-
+        and(succeeded(),
+            or(startsWith(variables['Build.SourceBranch'], 'refs/tags/v'),
+               eq('${{ parameters.promoteToStaging }}', 'true')))
+      useSlot: true
+      # UAT / integration suite against the staging slot goes here once it exists, e.g.:
+      # slotTestSteps:
+      #   - script: dotnet test tests/Aes301.IntegrationTests -- TestRunParameters.Parameter(name=\"baseUrl\", value=\"https://$(slotHostName)\")
+      #     displayName: Integration tests against slot
+
+  # Prod is split in two so there is an approval between slot smoke tests and the swap.
+  # Stage 1 (env aes301-prod: 2+ approvers = manual promotion): infra + deploy to slot + smoke test.
+  - template: pipelines/templates/stages/deploy-env.yml
+    parameters:
+      environmentName: prod
+      displayName: Prod (slot)
+      dependsOn: Deploy_staging
+      useSlot: true
+      swapInStage: false
+
+  # Stage 2 (env aes301-prod-swap): swap → post-swap health check → auto swap-back on failure.
+  - template: pipelines/templates/stages/swap-slot.yml
+    parameters:
+      environmentName: prod
+      displayName: Prod (swap)
+      dependsOn: Deploy_prod
+      adoEnvironment: aes301-prod-swap
