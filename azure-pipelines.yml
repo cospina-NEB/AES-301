@@ -46,7 +46,9 @@ stages:
       - template: pipelines/templates/jobs/build-dotnet.yml
       - template: pipelines/templates/jobs/validate-infra.yml
         parameters:
-          environments: [dev, qa, staging, prod]
+          # staging/prod service connections have branch control (main + v* tags only), so PR builds
+          # can't use them. dev/qa run the same Bicep, so their what-if still shows the change's effect.
+          environments: [dev, qa]
 
   - template: pipelines/templates/stages/deploy-env.yml
     parameters:

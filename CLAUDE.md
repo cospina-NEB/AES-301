@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository status
 
-AES-301 ("CHCM Azure Dev Ecosystem") follows [azure-devops-ecosystem-plan.md](azure-devops-ecosystem-plan.md), the design spec for everything here. Its "Next Steps" list tracks progress. Step 1 (the Bicep scaffold in `/infra`) is done. Step 2 (the multi-stage pipeline, Jira AES-304) is written but hasn't been run yet. The Claude PR bot and the .NET 8 application code don't exist yet. CI expects `Aes301.sln` and `src/Aes301.Web/Aes301.Web.csproj` (set in `pipelines/variables/common.yml`).
+AES-301 ("CHCM Azure Dev Ecosystem") follows [azure-devops-ecosystem-plan.md](azure-devops-ecosystem-plan.md), the design spec for everything here. Its "Next Steps" list tracks progress. Step 1 (the Bicep scaffold in `/infra`) is done. Step 2 (the multi-stage pipeline, Jira AES-304) and step 4 (the environment setup script, Jira AES-305) are written but haven't been run yet. The Claude PR bot and the .NET 8 application code don't exist yet. CI expects `Aes301.sln` and `src/Aes301.Web/Aes301.Web.csproj` (set in `pipelines/variables/common.yml`).
 
 The repo is hosted on GitHub (`cospina-NEB/AES-301`) and built by Azure Pipelines. Work is tracked in Jira (`nebulas.atlassian.net`, project AES; AES-301 is the parent story), not Azure Boards.
 
@@ -16,10 +16,28 @@ These need the Azure CLI (`az`), which includes Bicep. Every environment has its
 az bicep build --file infra/main.bicep                       # compile + lint (rules in bicepconfig.json)
 az bicep build-params --file infra/params/dev.bicepparam     # check one param file against main.bicep
 
-az group create -n rg-app-dev -l <region>
 az deployment group what-if -g rg-app-dev -f infra/main.bicep -p infra/params/dev.bicepparam
 az deployment group create  -g rg-app-dev -f infra/main.bicep -p infra/params/dev.bicepparam
 ```
+
+Environment setup (resource groups, pipeline identities, service connections, Azure DevOps Environments and their checks; Jira AES-305). It needs PowerShell 7.2+. Run it with `-WhatIf` first; it's safe to re-run:
+
+```powershell
+./scripts/setup-environments.ps1 -Organization https://dev.azure.com/<org> -Project <project> `
+    -SubscriptionId <id> -Location <region> `
+    -StagingApprovers '<group>' -ProdApprovers '<group>' -ProdSwapApprovers '<group>' -WhatIf
+
+# parse check (no Azure access needed)
+pwsh -NoProfile -Command "[System.Management.Automation.Language.Parser]::ParseFile('scripts/setup-environments.ps1',[ref]`$null,[ref]`$e); `$e"
+```
+
+## Environment setup script
+
+- The script manages desired state. Each resource is read, created if it's missing, and updated if it has drifted. Every change goes through `Confirm-Change` so that `-WhatIf` works. Change approvals and checks in the script, not in the Azure DevOps UI.
+- Azure DevOps calls are plain REST (`Invoke-Ado`), authenticated with an `az` token for resource `499b84ac-1321-427f-aa17-267ca6975798`. There's no PAT and no azure-devops CLI extension.
+- Each environment's pipeline identity is a user-assigned managed identity in its own resource group. It connects through workload identity federation: the script reads the issuer and subject from the service connection, then creates the federated credential. Its RBAC Administrator assignment has an ABAC condition limiting it to Key Vault Secrets User. If the Bicep ever assigns another role, add that role to `$RbacCondition`, or the deploy will fail with an authorization error.
+- The check type IDs in `$CheckTypes` aren't documented. If check creation fails, confirm them against a check created in the UI.
+- The Staging and Prod service connections have branch control (`main` and `v*` tags), so PR builds can't use them. That's why PR what-if in `azure-pipelines.yml` covers only `[dev, qa]`.
 
 ## Infra layout
 
@@ -40,7 +58,7 @@ az deployment group create  -g rg-app-dev -f infra/main.bicep -p infra/params/de
 - Templates find everything by naming convention, not by passing in variables. Service connections must be named `sc-aes301-<env>` and resource groups `rg-app-<env>`. Azure DevOps Environments must be named `aes301-<env>`, plus `aes301-prod-swap`. These names are compile-time values (`azureSubscription` can't come from a runtime variable). Renaming any of them means editing the templates.
 - Deploy stages use the `infra` and `app` pipeline artifacts published by CI, not a fresh checkout. `steps/deploy-infra.yml` runs `az deployment group create` and turns the `main.bicep` outputs into the job variables `webAppName`, `webAppHostName` and `slotHostName`. The later steps depend on those, so keep the output names in `main.bicep` in sync with that template.
 - Prod is split into two deployment jobs so there's an approval between the slot smoke tests and the swap. `Deploy_prod` (environment `aes301-prod`) deploys infra, deploys to the slot and runs smoke tests. `Swap_prod` (environment `aes301-prod-swap`) finds the web app by its `workload` tag, then runs the swap. `steps/swap-and-verify.yml` swaps, runs a health check and swaps back if a step after the swap fails. QA and Staging use the same steps inside their own stage.
-- Approvals and checks are configured on the Azure DevOps Environments in the Azure DevOps UI, not in YAML (plan step 4).
+- Approvals and checks are on the Azure DevOps Environments, not in YAML. They're managed by `scripts/setup-environments.ps1` (plan step 4).
 
 ## Target architecture (from the plan)
 

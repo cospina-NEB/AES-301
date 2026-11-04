@@ -11,7 +11,7 @@ The full design is in [azure-devops-ecosystem-plan.md](azure-devops-ecosystem-pl
 | 1 | Scaffold repo layout with Bicep modules per environment | Done |
 | 2 | Multi-stage `azure-pipelines.yml` ([AES-304](https://nebulas.atlassian.net/browse/AES-304)) | Written, not yet run |
 | 3 | Claude API PR-bot script wired into CI | Not started |
-| 4 | Azure DevOps Environments with approval gates | Not started |
+| 4 | Azure DevOps Environments with approval gates ([AES-305](https://nebulas.atlassian.net/browse/AES-305)) | Setup script written, not yet run |
 | 5 | Key Vault + variable groups per environment | Not started |
 
 ## Repository layout
@@ -36,6 +36,8 @@ pipelines/
     jobs/                 # CI: build-dotnet, validate-infra
     stages/               # deploy-env (one per environment), swap-slot (Prod)
     steps/                # deploy-infra, smoke-test, swap-and-verify
+scripts/
+  setup-environments.ps1  # one-time / re-runnable: RGs, pipeline identities, service connections, ADO Environments + checks
 bicepconfig.json          # Bicep linter rules
 .azuredevops/
   pull_request_template.md
@@ -45,7 +47,7 @@ bicepconfig.json          # Bicep linter rules
 
 | Trigger | What runs |
 | --- | --- |
-| PR to `main` | CI: restore, build, `dotnet format`, vulnerable-package scan, Semgrep, unit tests with a 75% line-coverage gate, package. Also Bicep lint, plus what-if for every environment if the PR touches `/infra` |
+| PR to `main` | CI: restore, build, `dotnet format`, vulnerable-package scan, Semgrep, unit tests with a 75% line-coverage gate, package. Also Bicep lint, plus what-if for Dev and QA if the PR touches `/infra` |
 | Merge to `main` | CI → Dev → QA |
 | Tag `v*`, or a manual run with **Promote to Staging** | CI → Dev → QA → Staging → Prod (slot) → Prod (swap) |
 
@@ -54,11 +56,44 @@ Prod has two approval gates. **Prod (slot)** deploys infra and the app to the st
 ### One-time setup before the first run
 
 1. **Application:** add the .NET 8 solution at `Aes301.sln`, with the web project at `src/Aes301.Web/Aes301.Web.csproj` and at least one test project. The app must serve `GET /health` with HTTP 200. To use different paths, change `pipelines/variables/common.yml`.
-2. **Resource groups:** create `rg-app-dev`, `rg-app-qa`, `rg-app-staging` and `rg-app-prod`.
-3. **Service connections:** create `sc-aes301-dev`, `sc-aes301-qa`, `sc-aes301-staging` and `sc-aes301-prod`. Each one is an Azure Resource Manager connection scoped to its own resource group. The infra deploy creates Key Vault role assignments, so each connection's identity needs **Contributor** plus **Role Based Access Control Administrator** on its resource group.
-4. **Environments:** create `aes301-dev`, `aes301-qa`, `aes301-staging`, `aes301-prod` and `aes301-prod-swap` in Azure DevOps. Add approvals according to the [Environments](#environments) table. Put the 2+ approvers on `aes301-prod`, and an approval on `aes301-prod-swap` (plan step 4).
-5. **Pipeline:** create a pipeline from `azure-pipelines.yml` using the GitHub connection. In GitHub branch protection for `main`, make this pipeline's check required.
-6. **Optional:** to also push the app zip to Azure Artifacts, set `artifactFeed` in `pipelines/variables/common.yml`.
+2. **Environments:** run [scripts/setup-environments.ps1](scripts/setup-environments.ps1) (see [Setting up environments](#setting-up-environments)). It creates the resource groups, service connections and Azure DevOps Environments, with their approvals and checks.
+3. **Pipeline:** create a pipeline from `azure-pipelines.yml` using the GitHub connection. In GitHub branch protection for `main`, make this pipeline's check required. On the first run, authorize the pipeline to use each `sc-aes301-<env>` connection and environment when it asks. The script doesn't grant access to all pipelines.
+4. **Optional:** to also push the app zip to Azure Artifacts, set `artifactFeed` in `pipelines/variables/common.yml`.
+
+## Setting up environments
+
+`scripts/setup-environments.ps1` is idempotent: run it again at any time, and it corrects anything that has drifted. Add `-WhatIf` to preview without changing anything.
+
+You need:
+
+- PowerShell 7.2+ and the Azure CLI, signed in with `az login`
+- **Owner** or **User Access Administrator** on the subscription
+- **Project Administrator** in the Azure DevOps project
+
+```powershell
+./scripts/setup-environments.ps1 `
+    -Organization https://dev.azure.com/<org> -Project <project> `
+    -SubscriptionId <subscription-id> -Location <region> `
+    -StagingApprovers '[<project>]\Product Owners' `
+    -ProdApprovers '[<project>]\Prod Approvers' `
+    -ProdSwapApprovers '[<project>]\Prod Approvers' `
+    -WhatIf
+```
+
+Approvers can be Azure DevOps groups (`'[Project]\Group'`) or users (email). `-QaApprovers` is optional; QA has no approval if you leave it out. `-Environments dev,qa` limits the run to those environments.
+
+What it sets up for each environment:
+
+| Piece | Name | Notes |
+| --- | --- | --- |
+| Resource group | `rg-app-<env>` | Tagged `environment`, `workload=aes301` |
+| Pipeline identity | `id-aes301-<env>-pipeline` | User-assigned managed identity, with **Contributor** on its resource group only. Also **RBAC Administrator** on that group, limited by a condition to assigning *Key Vault Secrets User*, the one role the Bicep assigns |
+| Service connection | `sc-aes301-<env>` | Workload identity federation, so no secret to rotate. Staging and Prod have **branch control** (`main` and `v*` tags), so a feature-branch run can't use them to skip the approvals |
+| Azure DevOps Environment | `aes301-<env>` (+ `aes301-prod-swap`) | Approval as in the table below, plus branch control and an exclusive lock on each |
+
+Branch control on the Staging and Prod connections stops PR builds from using them. That's why PR what-if covers only Dev and QA.
+
+> Change approvals and checks by editing and re-running the script, not in the Azure DevOps UI. The next run will overwrite UI changes.
 
 ## Environments
 
@@ -67,11 +102,12 @@ Each environment has its own resource group and App Service Plan. All the differ
 | Env | Resource group | Plan | Staging slot | Deploy trigger | Approval |
 | --- | --- | --- | --- | --- | --- |
 | Dev | `rg-app-dev` | B1 | No | Auto on merge to `main` | None |
-| QA | `rg-app-qa` | S1 | Yes | Auto after Dev smoke test | Optional |
-| Staging | `rg-app-staging` | S1 | Yes | Manual or on tag | Product owner |
-| Prod | `rg-app-prod` | P1v3 × 2 | Yes | Manual promotion | 2+ approvers |
+| QA | `rg-app-qa` | S1 | Yes | Auto after Dev smoke test | Optional (`-QaApprovers`) |
+| Staging | `rg-app-staging` | S1 | Yes | Manual or on tag | Product owner (`-StagingApprovers`) |
+| Prod (slot) | `rg-app-prod` | P1v3 × 2 | Yes | Manual promotion | 2+ approvers, and the person who requested the run can't approve (`-ProdApprovers`) |
+| Prod (swap) | — | — | — | After slot smoke tests pass | `-ProdSwapApprovers` |
 
-The deploy triggers and approvals take effect once steps 2 and 4 are built.
+The approvals take effect once `scripts/setup-environments.ps1` has been run.
 
 ## Deploying infrastructure
 
@@ -81,10 +117,7 @@ You need the [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli
 # Compile and lint
 az bicep build --file infra/main.bicep
 
-# One-time: create the environment's resource group
-az group create -n rg-app-dev -l <region>
-
-# Preview, then apply
+# Preview (the resource group comes from scripts/setup-environments.ps1), then apply
 az deployment group what-if -g rg-app-dev -f infra/main.bicep -p infra/params/dev.bicepparam
 az deployment group create  -g rg-app-dev -f infra/main.bicep -p infra/params/dev.bicepparam
 ```
